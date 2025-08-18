@@ -4,12 +4,20 @@ import json
 import os
 from typing import List
 
+from dotenv import load_dotenv
+
 import numpy as np
 import pandas as pd
 
 from .feature_pipeline import engineer_basic_features
 from .providers.alpha_vantage import AlphaVantageProvider
 from .utils_timeseries import restrict_rth, resample_ohlcv
+
+# Load variables from .env into os.environ
+load_dotenv()
+
+api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+print("Using API key:", api_key[:4] + "..." if api_key else "MISSING")
 
 def parse_csv_list(s: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
