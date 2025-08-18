@@ -23,7 +23,7 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     """
     if df.empty:
         return df
-    rule_map = {"1min": "1min", "5min": "5min", "15min": "15min", "1h": "1H", "1d": "1D"}
+    rule_map = {"1min": "1min", "5min": "5min", "15min": "15min", "1h": "1h", "1d": "1d"}
     r = rule_map.get(rule, rule)
     return (
         df.resample(r, origin="start")

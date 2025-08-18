@@ -1,30 +1,66 @@
 # src/data/providers/alpaca.py
 import os
+import requests
 import pandas as pd
-import alpaca_trade_api as tradeapi
 
 class AlpacaProvider:
-    def __init__(self):
-        key_id = os.getenv("ALPACA_KEY_ID")
-        secret = os.getenv("ALPACA_SECRET_KEY")
-        base_url = "https://paper-api.alpaca.markets"
-        if not key_id or not secret:
+    """
+    REST-only provider (no alpaca-trade-api SDK).
+    Uses: https://data.alpaca.markets/v2/stocks/{symbol}/bars
+    Env:
+      ALPACA_KEY_ID, ALPACA_SECRET_KEY
+    """
+
+    BASE = "https://data.alpaca.markets/v2"
+
+    def __init__(self, key_id: str | None = None, secret_key: str | None = None):
+        self.key = key_id or os.getenv("ALPACA_KEY_ID")
+        self.secret = secret_key or os.getenv("ALPACA_SECRET_KEY")
+        if not (self.key and self.secret):
             raise RuntimeError("Set ALPACA_KEY_ID and ALPACA_SECRET_KEY")
-        self.api = tradeapi.REST(key_id, secret, base_url, api_version="v2")
+        self.session = requests.Session()
+        self.session.headers.update({
+            "APCA-API-KEY-ID": self.key,
+            "APCA-API-SECRET-KEY": self.secret,
+        })
 
     def fetch_bars(self, symbol: str, start: str, end: str, interval: str) -> pd.DataFrame:
-        # Map our intervals to Alpaca resolutions
-        interval_map = {"1min": "1Min", "5min": "5Min", "15min": "15Min", "1h": "1H", "1d": "1D"}
-        tf = interval_map.get(interval)
-        if tf is None:
-            raise ValueError(f"Unsupported interval {interval}")
+        tf = {"1min":"1Min","5min":"5Min","15min":"15Min","1h":"1Hour","1d":"1Day"}[interval]
+        url = f"{self.BASE}/stocks/{symbol}/bars"
 
-        bars = self.api.get_bars(symbol, tf, start=start, end=end).df
-        if bars.empty:
-            return pd.DataFrame()
+        params = {
+            "timeframe": tf,
+            "start": start,  # ISO 8601
+            "end": end,
+            "limit": 10000,
+            "adjustment": "raw",   # or "all" if you want splits/div adjustments
+            "feed": "sip" if os.getenv("ALPACA_USE_SIP") == "1" else "iex",  # free = iex
+        }
 
-        # Ensure uniform OHLCV columns
-        df = bars[["open", "high", "low", "close", "volume"]].copy()
-        df.index = pd.to_datetime(bars.index)
-        return df
+        all_rows = []
+        page_token = None
+
+        while True:
+            if page_token:
+                params["page_token"] = page_token
+            r = self.session.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            j = r.json()
+            bars = j.get("bars", [])
+            if not bars:
+                break
+            all_rows.extend(bars)
+            page_token = j.get("next_page_token")
+            if not page_token:
+                break
+
+        if not all_rows:
+            return pd.DataFrame(columns=["open","high","low","close","volume"]).astype(float)
+
+        df = pd.DataFrame(all_rows)
+        # columns: t (timestamp), o,h,l,c,v, n (trade count), vw (vwap)
+        df["timestamp"] = pd.to_datetime(df["t"], utc=True)
+        df = df.set_index("timestamp").sort_index()
+        df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
+        return df[["open","high","low","close","volume"]].astype(float)
 
