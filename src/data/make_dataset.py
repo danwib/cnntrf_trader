@@ -33,6 +33,7 @@ def main():
     ap.add_argument("--rth-only", action="store_true")
     ap.add_argument("--out-features", required=True)
     ap.add_argument("--out-labels", required=True)
+    ap.add_argument("--out-symbol-ids", required=True)  # NEW: save per-row symbol ids
     ap.add_argument("--out-meta", required=True)
     args = ap.parse_args()
 
@@ -44,6 +45,9 @@ def main():
     has_apca = bool(os.getenv("ALPACA_KEY_ID") and os.getenv("ALPACA_SECRET_KEY"))
     has_av   = bool(os.getenv("ALPHAVANTAGE_API_KEY"))
     print(f"Data sources available → Alpaca: {has_apca} | AlphaVantage fallback: {has_av}")
+
+    # Stable symbol→id mapping based on the order provided
+    sym2id = {sym: i for i, sym in enumerate(symbols)}
 
     all_rows = []
     for sym in symbols:
@@ -70,7 +74,7 @@ def main():
             feats.append(fe)
         base_idx = frames["base"].index
         feat_df = pd.concat([fe.reindex(base_idx) for fe in feats], axis=1).dropna()
-        # (Optional) keep column order stable:
+        # Keep column order stable:
         feat_df = feat_df[sorted(feat_df.columns)]
 
         # Create labels on base interval (future log returns)
@@ -80,27 +84,35 @@ def main():
         label_df = label_df.dropna()
 
         combined = feat_df.join(label_df, how="inner")
-        combined["symbol"] = sym
+        combined["symbol"] = sym  # keep symbol to derive symbol_ids later
         all_rows.append(combined)
 
     if not all_rows:
         raise SystemExit("No data collected—check keys/symbols/date range.")
 
+    # Concatenate all symbols; rows are time-aligned within each symbol and then combined
     data = pd.concat(all_rows).sort_index()
 
     # Select features and pick the first horizon as main y (you can later train multi-target)
     feature_cols = [c for c in data.columns if "@" in c and not c.startswith("y_")]
     target_cols = [c for c in data.columns if c.startswith("y_")]
+
     X = data[feature_cols].to_numpy(dtype="float32")
     y = data[target_cols[0]].to_numpy(dtype="float32")
+    symbol_ids = data["symbol"].map(sym2id).to_numpy(dtype=np.int32)  # NEW
 
+    # Save artifacts (does not touch the provider cache)
     os.makedirs(os.path.dirname(args.out_features), exist_ok=True)
     np.save(args.out_features, X)
     np.save(args.out_labels, y)
+    np.save(args.out_symbol_ids, symbol_ids)  # NEW
+
+    # Write metadata (include sym2id mapping so the model can embed symbols later)
     with open(args.out_meta, "w") as f:
         json.dump(
             {
                 "symbols": symbols,
+                "sym2id": sym2id,  # NEW
                 "base_interval": args.base_interval,
                 "agg_intervals": agg_intervals,
                 "label_horizons": horizons,
@@ -112,8 +124,13 @@ def main():
             indent=2,
         )
 
-    print(f"Wrote:\n  X -> {args.out_features}\n  y -> {args.out_labels}\n  meta -> {args.out_meta}")
+    print(
+        "Wrote:\n"
+        f"  X            -> {args.out_features}\n"
+        f"  y            -> {args.out_labels}\n"
+        f"  symbol_ids   -> {args.out_symbol_ids}\n"
+        f"  meta         -> {args.out_meta}"
+    )
 
 if __name__ == "__main__":
     main()
-
