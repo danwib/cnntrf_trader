@@ -22,6 +22,15 @@ def parse_csv_list(s: str) -> List[str]:
 def future_log_return(df: pd.DataFrame, horizon_bars: int, price_col: str = "close") -> pd.Series:
     return (np.log(df[price_col].shift(-horizon_bars)) - np.log(df[price_col]))
 
+def interval_to_seconds(interval: str) -> int:
+    return {
+        "1min": 60,
+        "5min": 300,
+        "15min": 900,
+        "1h": 3600,
+        "1d": 86400,
+    }[interval]
+
 def main():
     ap = argparse.ArgumentParser(description="Build features/labels from market data (prefers Alpaca).")
     ap.add_argument("--symbols", required=True, help="Comma-separated, e.g., AAPL,MSFT,SPY")
@@ -33,7 +42,8 @@ def main():
     ap.add_argument("--rth-only", action="store_true")
     ap.add_argument("--out-features", required=True)
     ap.add_argument("--out-labels", required=True)
-    ap.add_argument("--out-symbol-ids", required=True)  # NEW: save per-row symbol ids
+    ap.add_argument("--out-symbol-ids", required=True)     # per-row symbol ids
+    ap.add_argument("--out-times", required=True)          # NEW: per-row UTC epoch seconds
     ap.add_argument("--out-meta", required=True)
     args = ap.parse_args()
 
@@ -99,26 +109,45 @@ def main():
 
     X = data[feature_cols].to_numpy(dtype="float32")
     y = data[target_cols[0]].to_numpy(dtype="float32")
-    symbol_ids = data["symbol"].map(sym2id).to_numpy(dtype=np.int32)  # NEW
+    symbol_ids = data["symbol"].map(sym2id).to_numpy(dtype=np.int32)
+
+    # Per-row timestamps (UTC epoch seconds) aligned to X/y rows
+    # Use int64 seconds to be robust; index is tz-aware UTC from providers.
+    row_times = (data.index.astype("int64") // 1_000_000_000).astype("int64")
+
+    # Compute summary ts for delta filtering
+    global_max_ts = int(row_times.max()) if len(row_times) else None
+    per_symbol_max_ts = (
+        data["symbol"]
+        .groupby(data["symbol"])
+        .apply(lambda s: int((data.loc[s.index].index.astype("int64").max() // 1_000_000_000)))
+        .to_dict()
+    )
+
+    bar_seconds = interval_to_seconds(args.base_interval)
 
     # Save artifacts (does not touch the provider cache)
     os.makedirs(os.path.dirname(args.out_features), exist_ok=True)
     np.save(args.out_features, X)
     np.save(args.out_labels, y)
-    np.save(args.out_symbol_ids, symbol_ids)  # NEW
+    np.save(args.out_symbol_ids, symbol_ids)
+    np.save(args.out_times, row_times)
 
-    # Write metadata (include sym2id mapping so the model can embed symbols later)
+    # Write metadata (include sym2id mapping and ts summaries)
     with open(args.out_meta, "w") as f:
         json.dump(
             {
                 "symbols": symbols,
-                "sym2id": sym2id,  # NEW
+                "sym2id": sym2id,
                 "base_interval": args.base_interval,
                 "agg_intervals": agg_intervals,
                 "label_horizons": horizons,
                 "feature_cols": feature_cols,
                 "target_cols": target_cols,
                 "rth_only": bool(args.rth_only),
+                "global_max_ts": global_max_ts,
+                "per_symbol_max_ts": per_symbol_max_ts,
+                "bar_seconds": bar_seconds,
             },
             f,
             indent=2,
@@ -129,6 +158,7 @@ def main():
         f"  X            -> {args.out_features}\n"
         f"  y            -> {args.out_labels}\n"
         f"  symbol_ids   -> {args.out_symbol_ids}\n"
+        f"  times        -> {args.out_times}\n"
         f"  meta         -> {args.out_meta}"
     )
 
