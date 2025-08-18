@@ -16,3 +16,4 @@ pandas-datareader
 tenacity
 python-dateutil
 python-dotenv
+pyarrow
