@@ -1,0 +1,10 @@
+torch
+fastapi
+uvicorn
+pydantic
+hydra-core
+omegaconf
+pandas
+scikit-learn
+tqdm
+pytest
