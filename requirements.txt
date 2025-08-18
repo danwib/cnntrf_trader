@@ -17,3 +17,4 @@ tenacity
 python-dateutil
 python-dotenv
 pyarrow
+alpaca-trade-api

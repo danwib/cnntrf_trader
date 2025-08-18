@@ -6,3 +6,4 @@ models/
 *.npy
 *.pt
 .env
+data/cache

@@ -11,23 +11,19 @@ import pandas as pd
 
 from .feature_pipeline import engineer_basic_features
 from .utils_timeseries import resample_ohlcv
-from .fetch import get_bars  # <-- unified fetcher (cache → yfinance → AV)
+from .fetch import get_bars  # unified fetch: cache → Alpaca → yfinance → Alpha Vantage
 
-# Load variables from .env into os.environ
+# Load variables from .env into os.environ (optional convenience)
 load_dotenv()
-
-api_key = os.getenv("ALPHAVANTAGE_API_KEY")
-print("Using API key:", (api_key[:4] + "...") if api_key else "MISSING")
 
 def parse_csv_list(s: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
 def future_log_return(df: pd.DataFrame, horizon_bars: int, price_col: str = "close") -> pd.Series:
-    import numpy as np
     return (np.log(df[price_col].shift(-horizon_bars)) - np.log(df[price_col]))
 
 def main():
-    ap = argparse.ArgumentParser(description="Build features/labels from cached/yfinance/Alpha Vantage data.")
+    ap = argparse.ArgumentParser(description="Build features/labels from market data (prefers Alpaca).")
     ap.add_argument("--symbols", required=True, help="Comma-separated, e.g., AAPL,MSFT,SPY")
     ap.add_argument("--start", required=True, help="UTC ISO date (e.g., 2024-01-01)")
     ap.add_argument("--end", required=True, help="UTC ISO date (e.g., 2024-12-31)")
@@ -44,9 +40,14 @@ def main():
     agg_intervals = parse_csv_list(args.agg_intervals)
     horizons = [int(x) for x in parse_csv_list(args.label_horizons)]
 
+    # Simple banner so you can see which sources are wired
+    has_apca = bool(os.getenv("ALPACA_KEY_ID") and os.getenv("ALPACA_SECRET_KEY"))
+    has_av   = bool(os.getenv("ALPHAVANTAGE_API_KEY"))
+    print(f"Data sources available → Alpaca: {has_apca} | AlphaVantage fallback: {has_av}")
+
     all_rows = []
     for sym in symbols:
-        print(f"[{sym}] fetching {args.base_interval} (cache → yfinance → Alpha Vantage fallback)...")
+        print(f"[{sym}] fetching {args.base_interval} (cache → Alpaca → yfinance → AlphaVantage)...")
         df = get_bars(sym, args.start, args.end, args.base_interval, rth_only=args.rth_only)
         if df.empty:
             print(f"[{sym}] no data.")
@@ -69,6 +70,8 @@ def main():
             feats.append(fe)
         base_idx = frames["base"].index
         feat_df = pd.concat([fe.reindex(base_idx) for fe in feats], axis=1).dropna()
+        # (Optional) keep column order stable:
+        feat_df = feat_df[sorted(feat_df.columns)]
 
         # Create labels on base interval (future log returns)
         label_df = pd.DataFrame(index=feat_df.index)
@@ -81,7 +84,7 @@ def main():
         all_rows.append(combined)
 
     if not all_rows:
-        raise SystemExit("No data collected—check symbols/date range/API limits.")
+        raise SystemExit("No data collected—check keys/symbols/date range.")
 
     data = pd.concat(all_rows).sort_index()
 
@@ -113,3 +116,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
