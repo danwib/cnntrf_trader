@@ -1,2 +1,2 @@
-model:
-  in_channels: 8
+data:
+  base_interval: "15min"

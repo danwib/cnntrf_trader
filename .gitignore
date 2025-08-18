@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+artifacts/
+checkpoints/
+models/
+*.npy
+*.pt
