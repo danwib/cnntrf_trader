@@ -69,7 +69,7 @@ def build_raw(symbols: str, start: str, end: str, out_dir: Path):
         "--out-features", str(x_path),
         "--out-labels", str(y_path),
         "--out-symbol-ids", str(sid_path),
-        "--out-times", str(t_path),              # << requires make_dataset to support this
+        "--out-times", str(t_path),          # <-- now included
         "--out-meta", str(meta_path),
     ]
     sh(cmd, cwd=ROOT)
@@ -144,7 +144,6 @@ def init_extended_master_from_version(version_dir: Path):
     """
     ensure_dir(EXTENDED)
 
-    # Load splits and concat
     ztr = np.load(version_dir / "train.npz")
     zva = np.load(version_dir / "val.npz")
     zte = np.load(version_dir / "test.npz")
@@ -153,12 +152,10 @@ def init_extended_master_from_version(version_dir: Path):
     y = np.concatenate([ztr["y"], zva["y"], zte["y"]], axis=0)
     sid = np.concatenate([ztr["sym_id"], zva["sym_id"], zte["sym_id"]], axis=0)
 
-    # We don't have per-row timestamps in splits; add a placeholder ts of zeros.
-    # (Deltas we append WILL include 'ts', and we'll dedupe by (sid, ts) where ts>0.)
+    # No timestamps in splits; fill zeros. Deltas carry real ts and we dedupe by (sid, ts).
     ts = np.zeros(len(X), dtype=np.int64)
 
     np.savez_compressed(EXTENDED / "cum.npz", X=X, y=y, sym_id=sid, ts=ts)
-    # Remember which version/scalers this extended master ties to
     (EXTENDED / "MASTER_VERSION.txt").write_text(version_dir.name)
     print(f"[EXTENDED] initialized from {version_dir.name} with {len(X)} rows")
 
@@ -173,7 +170,6 @@ def transform_with_existing_scalers_and_filter(raw_X: Path, raw_y: Path, raw_sid
     X = np.load(raw_X); y = np.load(raw_y); symids = np.load(raw_sid); times = np.load(raw_t)
     master_meta = load_meta(master_dir / "meta.json")
 
-    # Compute cutoff to purge context overlap
     bar_seconds = master_meta.get("bar_seconds", 900)  # default 15min
     purge_bars = (seq_len - 1) + max_horizon
     if "global_max_ts" not in master_meta:
@@ -226,7 +222,7 @@ def append_delta_to_extended_master(update_npz: Path):
     zu = np.load(update_npz)
     Xu, yu, siu, tsu = zu["X"], zu["y"], zu["sym_id"], zu["ts"]
 
-    # De-duplication by (sym_id, ts). Extended master may have old rows with ts=0; we keep all ts>0.
+    # De-dup by (sym_id, ts). Old rows may have ts=0; keep all ts>0 from deltas.
     if len(tsc) > 0:
         existing = set(zip(sic.tolist(), tsc.tolist()))
         mask_new = np.array([(int(si), int(t)) not in existing for si, t in zip(siu, tsu)], dtype=bool)
@@ -237,10 +233,10 @@ def append_delta_to_extended_master(update_npz: Path):
         print("[EXTENDED] No truly new rows after de-dup. Skipping append.")
         return
 
-    Xc2 = np.concatenate([Xc, Xu[mask_new]], axis=0)
-    yc2 = np.concatenate([yc, yu[mask_new]], axis=0)
-    sic2= np.concatenate([sic, siu[mask_new]], axis=0)
-    tsc2= np.concatenate([tsc, tsu[mask_new]], axis=0)
+    Xc2  = np.concatenate([Xc,  Xu[mask_new]], axis=0)
+    yc2  = np.concatenate([yc,  yu[mask_new]], axis=0)
+    sic2 = np.concatenate([sic, siu[mask_new]], axis=0)
+    tsc2 = np.concatenate([tsc, tsu[mask_new]], axis=0)
 
     np.savez_compressed(EXTENDED / "cum.npz", X=Xc2, y=yc2, sym_id=sic2, ts=tsc2)
     print(f"[EXTENDED] appended {mask_new.sum()} new rows; total now {len(Xc2)}")
