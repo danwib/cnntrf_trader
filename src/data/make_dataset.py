@@ -10,14 +10,14 @@ import numpy as np
 import pandas as pd
 
 from .feature_pipeline import engineer_basic_features
-from .providers.alpha_vantage import AlphaVantageProvider
-from .utils_timeseries import restrict_rth, resample_ohlcv
+from .utils_timeseries import resample_ohlcv
+from .fetch import get_bars  # <-- unified fetcher (cache → yfinance → AV)
 
 # Load variables from .env into os.environ
 load_dotenv()
 
 api_key = os.getenv("ALPHAVANTAGE_API_KEY")
-print("Using API key:", api_key[:4] + "..." if api_key else "MISSING")
+print("Using API key:", (api_key[:4] + "...") if api_key else "MISSING")
 
 def parse_csv_list(s: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
@@ -27,7 +27,7 @@ def future_log_return(df: pd.DataFrame, horizon_bars: int, price_col: str = "clo
     return (np.log(df[price_col].shift(-horizon_bars)) - np.log(df[price_col]))
 
 def main():
-    ap = argparse.ArgumentParser(description="Build features/labels from Alpha Vantage data.")
+    ap = argparse.ArgumentParser(description="Build features/labels from cached/yfinance/Alpha Vantage data.")
     ap.add_argument("--symbols", required=True, help="Comma-separated, e.g., AAPL,MSFT,SPY")
     ap.add_argument("--start", required=True, help="UTC ISO date (e.g., 2024-01-01)")
     ap.add_argument("--end", required=True, help="UTC ISO date (e.g., 2024-12-31)")
@@ -40,23 +40,17 @@ def main():
     ap.add_argument("--out-meta", required=True)
     args = ap.parse_args()
 
-    if not os.getenv("ALPHAVANTAGE_API_KEY"):
-        raise SystemExit("Set ALPHAVANTAGE_API_KEY before running.")
-
-    provider = AlphaVantageProvider()
     symbols = parse_csv_list(args.symbols)
     agg_intervals = parse_csv_list(args.agg_intervals)
     horizons = [int(x) for x in parse_csv_list(args.label_horizons)]
 
     all_rows = []
     for sym in symbols:
-        print(f"[{sym}] fetching {args.base_interval} from Alpha Vantage...")
-        df = provider.fetch_bars(sym, args.start, args.end, args.base_interval)
+        print(f"[{sym}] fetching {args.base_interval} (cache → yfinance → Alpha Vantage fallback)...")
+        df = get_bars(sym, args.start, args.end, args.base_interval, rth_only=args.rth_only)
         if df.empty:
             print(f"[{sym}] no data.")
             continue
-        if args.rth_only and args.base_interval in ("1min", "5min", "15min", "1h"):
-            df = restrict_rth(df)
 
         # Build multi-scale frames (base + agg)
         frames = {"base": df}
