@@ -21,7 +21,7 @@ class DepthwiseSeparableTCNBlock(nn.Module):
         x = _causal_pad_1d(x, self.kernel_size, self.dilation)
         x = self.dw(x)
         x = self.gn(x)
-        x = torch.glu(self.pw(x), dim=1)  # gated linear unit
+        x = F.glu(self.pw(x), dim=1)  # gated linear unit
         x = self.dropout(x)
         return x + residual
 

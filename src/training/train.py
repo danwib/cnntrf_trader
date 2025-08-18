@@ -15,16 +15,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-# ---- Your existing datamodule (assumed present from earlier work) ----
-# WindowedDataset must yield: x: (B, C, L), sym_id: (B,), y: (B,)
-try:
-    from .data_module import build_dataloaders, WindowedDataset
-except Exception as e:
-    print("[train] Could not import data_module. Ensure src/training/data_module.py exists.", file=sys.stderr)
-    raise
+from .data_module import build_dataloaders, WindowedDataset
 
 # ---- New PatchTST hybrid model ----
 from src.models.cnn_patchtst import CNNPatchTST, CNNPatchTSTConfig
+
 
 # ---- Optional: baseline model (keep for A/B). Safe import inside branch. ----
 def make_baseline_model(in_channels: int, num_symbols: int, seq_len: int, args) -> nn.Module:
@@ -274,7 +269,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=args.use-amp and device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp and device.type == "cuda")
 
     # Save configs
     save_config(

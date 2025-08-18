@@ -101,6 +101,10 @@ def build_datasets(
     stride: int = 1,
     device: Optional[torch.device] = None,
 ) -> Datasets:
+    """
+    Build WindowedDataset objects for train/val/test from a 'master' directory
+    that contains train.npz / val.npz / test.npz.
+    """
     root = Path(root).resolve()
     train_p = root / "train.npz"
     val_p = root / "val.npz"
@@ -135,8 +139,46 @@ def build_loaders(
     pin_memory: bool = True,
     drop_last: bool = False,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader]]:
+    """
+    Turn Datasets into PyTorch DataLoaders.
+    """
     kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory, drop_last=drop_last)
     train_loader = DataLoader(datasets.train, shuffle=True, **kwargs)
     val_loader = DataLoader(datasets.val, shuffle=False, **kwargs) if datasets.val is not None else None
     test_loader = DataLoader(datasets.test, shuffle=False, **kwargs) if datasets.test is not None else None
     return train_loader, val_loader, test_loader
+
+
+# ------------------------------
+# Canonical trainer-facing API
+# ------------------------------
+def build_dataloaders(
+    master_dir: str | Path = "artifacts/datasets/master",
+    seq_len: int = 64,
+    stride: int = 1,
+    batch_size: int = 256,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    drop_last: bool = False,
+    device: Optional[torch.device] = None,
+) -> Dict[str, DataLoader]:
+    """
+    Normalized entrypoint expected by train/eval scripts.
+
+    It composes:
+        build_datasets(root=master_dir, seq_len, stride, device)
+        -> build_loaders(datasets, batch_size, num_workers, pin_memory, drop_last)
+
+    Returns a dict with keys: 'train', 'val', 'test'.
+    """
+    # If 'master_dir' is a symlink or a file pointer, treat it as the effective root:
+    # build_datasets() works directly with either the symlink or the resolved dir.
+    datasets = build_datasets(root=master_dir, seq_len=seq_len, stride=stride, device=device)
+    train_loader, val_loader, test_loader = build_loaders(
+        datasets,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+    )
+    return {"train": train_loader, "val": val_loader, "test": test_loader}
