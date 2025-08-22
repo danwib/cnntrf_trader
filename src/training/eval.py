@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional, List
 
 import numpy as np
 import torch
@@ -52,6 +52,15 @@ def infer_dims(master_dir: Path) -> Tuple[int, int]:
     return F, num_symbols
 
 
+def read_meta(master_dir: Path) -> Dict[str, Any]:
+    meta_path = master_dir / "meta.json"
+    if meta_path.exists():
+        with open(meta_path, "r") as f:
+            return json.load(f)
+    # Fallback empty
+    return {}
+
+
 def load_checkpoint(ckpt_path: Path, device: torch.device) -> Dict[str, Any]:
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -59,18 +68,15 @@ def load_checkpoint(ckpt_path: Path, device: torch.device) -> Dict[str, Any]:
 
 
 def make_baseline_model(in_channels: int, num_symbols: int, seq_len: int, saved_args: Dict[str, Any]) -> nn.Module:
-    """
-    Reconstruct the older baseline CNN+Transformer if you still have src/models/cnn_transformer.py.
-    """
+    """Reconstruct the older baseline CNN+Transformer if still present."""
     try:
         from src.models.cnn_transformer import CNNTransformer, CNNTransformerConfig  # type: ignore
     except Exception as e:
         raise RuntimeError(
             "Checkpoint indicates a 'baseline' model, but src/models/cnn_transformer.py "
-            "is missing. Restore that file or re-evaluate with a PatchTST checkpoint."
+            "is missing. Restore that file or evaluate a PatchTST checkpoint."
         ) from e
 
-    # Do best-effort mapping from saved train args (if present)
     emb_dim = saved_args.get("emb_dim", 12)
     d_model = saved_args.get("d_model", 128)
     n_heads = saved_args.get("n_heads", 4)
@@ -95,30 +101,24 @@ def make_baseline_model(in_channels: int, num_symbols: int, seq_len: int, saved_
 
 
 def rebuild_model(ckpt: Dict[str, Any], num_features: int, num_symbols: int, device: torch.device) -> nn.Module:
-    """
-    Rebuild the exact model class from checkpoint metadata.
-    Prefers explicit CNNPatchTSTConfig; falls back to baseline if needed.
-    """
+    """Rebuild the exact model class from checkpoint metadata."""
     model_cfg = ckpt.get("model_cfg", {})
     train_args = ckpt.get("train_args", {})
-    # If the checkpoint was saved by the new trainer, model_cfg will match CNNPatchTSTConfig keys.
-    # Heuristic: PatchTST configs include 'patch_size' and 'd_model' AND 'in_channels'.
     if all(k in model_cfg for k in ("in_channels", "num_symbols", "seq_len", "patch_size", "d_model")):
-        # Respect saved config exactly (safer)
         cfg = CNNPatchTSTConfig(**model_cfg)
         model = CNNPatchTST(cfg).to(device)
         return model
-
-    # Else try baseline path
+    # fallback to baseline
     seq_len = int(train_args.get("seq_len", 64))
     model = make_baseline_model(num_features, num_symbols, seq_len, train_args).to(device)
     return model
 
 
 @torch.no_grad()
-def compute_metrics(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+def gather_preds(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, torch.Tensor]:
+    """Collect predictions, targets, and symbol ids."""
     model.eval()
-    preds, targets = [], []
+    preds, targets, syms = [], [], []
     for x, s, y in loader:
         x = x.to(device, non_blocking=True)
         s = s.to(device, non_blocking=True)
@@ -126,15 +126,18 @@ def compute_metrics(model: nn.Module, loader: DataLoader, device: torch.device) 
         yhat = model(x, s)
         preds.append(yhat.detach().cpu())
         targets.append(y.detach().cpu())
-
+        syms.append(s.detach().cpu())
     yhat = torch.cat(preds, dim=0).squeeze(1)
     y = torch.cat(targets, dim=0).squeeze(1)
+    sym = torch.cat(syms, dim=0).long()
+    return {"yhat": yhat, "y": y, "sym": sym}
 
+
+def core_metrics(yhat: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
     mse = torch.mean((yhat - y) ** 2).item()
     mae = torch.mean(torch.abs(yhat - y)).item()
     dir_acc = torch.mean((torch.sign(yhat) == torch.sign(y)).float()).item()
-
-    # Top-decile hit rate by |y|
+    # top-decile hit rate by |y|
     N = y.numel()
     if N >= 10:
         k = max(1, int(0.1 * N))
@@ -142,27 +145,90 @@ def compute_metrics(model: nn.Module, loader: DataLoader, device: torch.device) 
         top_hit = torch.mean((torch.sign(yhat[idx]) == torch.sign(y[idx])).float()).item()
     else:
         top_hit = float("nan")
-
-    # Pearson correlation (useful for ranking quality)
+    # Pearson r
     yc = y - y.mean()
     ph = yhat - yhat.mean()
     denom = (torch.sqrt((yc ** 2).sum()) * torch.sqrt((ph ** 2).sum()))
     corr = (float((yc * ph).sum() / denom) if denom.item() > 0 else 0.0)
+    return {"mse": mse, "mae": mae, "dir_acc": dir_acc, "hit_rate_top_decile": top_hit, "pearson_r": corr, "n": float(N)}
 
-    return {
-        "mse": mse,
-        "mae": mae,
-        "dir_acc": dir_acc,
-        "hit_rate_top_decile": top_hit,
-        "pearson_r": corr,
-        "n": float(N),
-    }
+
+def baselines(y: torch.Tensor) -> Dict[str, float]:
+    """Simple context baselines."""
+    p_up = torch.mean((y > 0).float()).item()
+    majority = max(p_up, 1 - p_up)  # always predict the majority sign
+    return {"coin_flip": 0.5, "majority_sign": majority, "p_up": p_up}
+
+
+def thresholded_expectancy(
+    yhat: torch.Tensor,
+    y: torch.Tensor,
+    top_pcts: List[int],
+    cost_bps: float = 2.0,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Trade only when |yhat| is in top X% of scores.
+    PnL per trade (log-return approximation): long if yhat>0 -> +y; short if yhat<0 -> -y.
+    Net subtracts a fixed round-trip cost in bps (bps/1e4).
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    abs_yhat = torch.abs(yhat)
+    N = y.shape[0]
+    cost = cost_bps / 1e4  # convert bp to decimal return
+
+    for pct in top_pcts:
+        q = 1.0 - (pct / 100.0)
+        tau = torch.quantile(abs_yhat, q) if N > 0 else torch.tensor(float("inf"))
+        sel = abs_yhat >= tau
+        n_sel = int(sel.sum().item())
+        coverage = n_sel / max(N, 1)
+
+        if n_sel == 0:
+            out[str(pct)] = {"coverage": 0.0, "trades": 0.0, "gross_bps": float("nan"),
+                             "net_bps": float("nan"), "hit_rate": float("nan")}
+            continue
+
+        gross = (torch.sign(yhat[sel]) * y[sel]).mean().item()
+        net = gross - cost  # pay cost every round-trip
+        hit = torch.mean((torch.sign(yhat[sel]) == torch.sign(y[sel])).float()).item()
+
+        out[str(pct)] = {
+            "coverage": coverage,
+            "trades": float(n_sel),
+            "gross_bps": gross * 1e4,
+            "net_bps": net * 1e4,
+            "hit_rate": hit,
+        }
+    return out
+
+
+def per_symbol_metrics(yhat: torch.Tensor, y: torch.Tensor, sym: torch.Tensor) -> Dict[int, Dict[str, float]]:
+    out: Dict[int, Dict[str, float]] = {}
+    for s in torch.unique(sym).tolist():
+        mask = (sym == s)
+        ys, yhs = y[mask], yhat[mask]
+        if ys.numel() == 0:
+            continue
+        m = core_metrics(yhs, ys)
+        out[int(s)] = {"n": m["n"], "mse": m["mse"], "mae": m["mae"], "dir_acc": m["dir_acc"]}
+    return out
+
+
+def write_per_symbol_csv(path: Path, per_sym: Dict[int, Dict[str, float]], symmap: Optional[Dict[int, str]] = None) -> None:
+    import csv
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        header = ["sym_id", "symbol", "n", "mse", "mae", "dir_acc"]
+        w.writerow(header)
+        for sid, stats in sorted(per_sym.items()):
+            sym = symmap.get(sid, "") if symmap else ""
+            w.writerow([sid, sym, int(stats["n"]), stats["mse"], stats["mae"], stats["dir_acc"]])
 
 
 # ------------------------- main -------------------------
 
 def main():
-    p = argparse.ArgumentParser(description="Evaluate a trained checkpoint on the test split")
+    p = argparse.ArgumentParser(description="Evaluate a trained checkpoint on the test split with richer metrics")
     p.add_argument("--checkpoint", required=True, type=str, help="Path to .pt checkpoint")
     p.add_argument("--datasets-root", type=str, default="artifacts/datasets", help="Root where 'master' lives")
     p.add_argument("--batch-size", type=int, default=512)
@@ -170,6 +236,11 @@ def main():
     p.add_argument("--seq-len", type=int, default=None, help="Override seq_len for loader (usually read from ckpt)")
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--out", type=str, default=None, help="Where to write metrics JSON (defaults next to checkpoint)")
+    # New options for expectancy
+    p.add_argument("--cost-bps", type=float, default=2.0, help="Round-trip cost per trade, in bps")
+    p.add_argument("--trade-top-pcts", type=str, default="10,20,30,40",
+                   help="Comma list of top-|ŷ| percent thresholds to evaluate (e.g., 10,30,50)")
+    p.add_argument("--per-symbol-csv", type=str, default=None, help="Optional CSV path for per-symbol metrics")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -178,6 +249,7 @@ def main():
 
     datasets_root = Path(args.datasets_root)
     master_dir = resolve_master_dir(datasets_root)
+    meta = read_meta(master_dir)
 
     # Infer dims
     num_features, num_symbols = infer_dims(master_dir)
@@ -186,7 +258,7 @@ def main():
     saved_args = ckpt.get("train_args", {})
     seq_len = int(args.seq_len or saved_args.get("seq_len", 64))
 
-    # Build loaders (test only is fine, but we'll reuse builder for consistency)
+    # Build loaders (test only is fine)
     loaders = build_dataloaders(
         master_dir=str(master_dir),
         seq_len=seq_len,
@@ -200,18 +272,71 @@ def main():
     model = rebuild_model(ckpt, num_features, num_symbols, device)
     model.load_state_dict(ckpt["model_state"], strict=True)
 
-    # Compute metrics
-    metrics = compute_metrics(model, test_loader, device)
-    print(json.dumps(metrics, indent=2))
+    # Compute predictions
+    bundle = gather_preds(model, test_loader, device)
+    yhat, y, sym = bundle["yhat"], bundle["y"], bundle["sym"]
+
+    # Core metrics
+    metrics = core_metrics(yhat, y)
+
+    # Baselines
+    base = baselines(y)
+    metrics["baseline_coin_flip"] = base["coin_flip"]
+    metrics["baseline_majority_sign"] = base["majority_sign"]
+    metrics["p_up"] = base["p_up"]
+
+    # Thresholded, costed expectancy
+    top_pcts = [int(s.strip()) for s in args.trade_top_pcts.split(",") if s.strip()]
+    exp = thresholded_expectancy(yhat, y, top_pcts=top_pcts, cost_bps=args.cost_bps)
+
+    # Per-symbol breakdown (optional CSV)
+    per_sym = per_symbol_metrics(yhat, y, sym)
+    symmap = None
+    if "sym2id" in meta and isinstance(meta["sym2id"], dict):
+        # meta["sym2id"] maps symbol->id; invert it
+        symmap = {int(v): k for k, v in meta["sym2id"].items()}
+    if args.per_symbol_csv:
+        write_per_symbol_csv(Path(args.per_symbol_csv), per_sym, symmap)
+
+    # Assemble report
+    report = {
+        "checkpoint": str(ckpt_path),
+        "master_dir": str(master_dir),
+        "seq_len": seq_len,
+        "n_test": int(metrics["n"]),
+        "metrics": {
+            "mse": metrics["mse"],
+            "mae": metrics["mae"],
+            "dir_acc": metrics["dir_acc"],
+            "hit_rate_top_decile": metrics["hit_rate_top_decile"],
+            "pearson_r": metrics["pearson_r"],
+        },
+        "baselines": {
+            "coin_flip": metrics["baseline_coin_flip"],
+            "majority_sign": metrics["baseline_majority_sign"],
+            "p_up": metrics["p_up"],
+        },
+        "expectancy": exp,
+        "per_symbol_summary": {
+            "count": len(per_sym),
+            "avg_dir_acc": float(np.mean([v["dir_acc"] for v in per_sym.values()])) if per_sym else float("nan"),
+        },
+    }
 
     # Save metrics JSON
     if args.out:
         out_path = Path(args.out)
     else:
-        out_path = ckpt_path.parent / "metrics_test.json"
+        out_path = ckpt_path.parent / "metrics_test_rich.json"
     with open(out_path, "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(report, f, indent=2)
+    print(json.dumps(report, indent=2))
     print(f"Wrote metrics to {out_path}")
+
+    # Optional CSV note
+    if args.per_symbol_csv:
+        print(f"Wrote per-symbol metrics to {args.per_symbol_csv}")
+
 
 if __name__ == "__main__":
     main()
