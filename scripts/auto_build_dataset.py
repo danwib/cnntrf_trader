@@ -5,6 +5,7 @@
 from __future__ import annotations
 import argparse, subprocess, sys, os, json, shutil, datetime as dt
 from pathlib import Path
+from typing import Dict, Tuple
 
 import numpy as np
 import joblib
@@ -45,7 +46,7 @@ def load_meta(meta_path: Path) -> dict:
     with open(meta_path, "r") as f:
         return json.load(f)
 
-def build_raw(symbols: str, start: str, end: str, out_dir: Path):
+def build_raw(symbols: str, start: str, end: str, out_dir: Path) -> Tuple[Path, Path, Path, Path, Path]:
     """
     Calls make_dataset.py to produce raw artifacts into out_dir/tmp_raw:
       X.npy, y.npy, symbol_ids.npy, times.npy, meta.json
@@ -69,49 +70,156 @@ def build_raw(symbols: str, start: str, end: str, out_dir: Path):
         "--out-features", str(x_path),
         "--out-labels", str(y_path),
         "--out-symbol-ids", str(sid_path),
-        "--out-times", str(t_path),          # <-- now included
+        "--out-times", str(t_path),
         "--out-meta", str(meta_path),
     ]
     sh(cmd, cwd=ROOT)
     return x_path, y_path, sid_path, t_path, meta_path
 
+# ---------------- helpers for splitting ---------------- #
+
+def _bars_per_trading_day(meta: Dict) -> int:
+    """
+    Estimate bars per *trading* day from meta.
+    If RTH 15m: 26; else derive from bar_seconds and RTH flag.
+    """
+    bar_seconds = int(meta.get("bar_seconds", 900))
+    rth_only = bool(meta.get("rth_only", True))
+    if rth_only:
+        trading_seconds = int(6.5 * 3600)  # 09:30–16:00
+    else:
+        trading_seconds = 24 * 3600
+    bpd = max(1, int(round(trading_seconds / bar_seconds)))
+    return bpd
+
+def _row_slices_with_purge(N: int, num_symbols: int, n_val_rows: int, n_test_rows: int,
+                           purge_bars: int) -> Tuple[slice, slice, slice]:
+    """
+    Compute contiguous train/val/test slices from the tail, inserting a purge gap
+    of 'purge_bars' base bars per symbol between train→val and val→test.
+    We work in *rows*; one base bar across all symbols ≈ num_symbols rows.
+    """
+    purge_rows = purge_bars * num_symbols
+
+    # Build from the tail to guarantee the requested test size
+    test_end = N
+    test_start = max(0, test_end - n_test_rows)
+
+    # Purge before test
+    val_end = max(0, test_start - purge_rows)
+    val_start = max(0, val_end - n_val_rows)
+
+    # Purge before val
+    train_end = max(0, val_start - purge_rows)
+    train_start = 0
+
+    # Safety: if train becomes empty/negative, shrink purges first, then val
+    if train_end <= train_start:
+        # Try removing purges
+        train_end = max(0, val_start)
+        if train_end <= train_start:
+            # Move boundary earlier by shrinking val
+            deficit = (train_start + 1) - train_end
+            val_start = max(0, val_start - deficit)
+            train_end = max(0, val_start)
+
+    tr_sl = slice(train_start, train_end)
+    va_sl = slice(val_start, val_end)
+    te_sl = slice(test_start, test_end)
+    return tr_sl, va_sl, te_sl
+
+def _approx_rows_for_days(test_days: int, val_days: int, meta: Dict, symids: np.ndarray) -> Tuple[int, int, int]:
+    """
+    Given desired trading days for val/test, approximate row counts using bars_per_day * num_symbols.
+    """
+    N = int(symids.shape[0])
+    num_symbols = int(np.max(symids)) + 1 if symids.size > 0 else 1
+    bpd = _bars_per_trading_day(meta)
+    n_test_rows = max(1, int(test_days) * bpd * num_symbols) if test_days > 0 else 0
+    n_val_rows  = max(0, int(val_days)  * bpd * num_symbols) if val_days  > 0 else 0
+
+    # Cap to dataset size
+    n_test_rows = min(n_test_rows, N)
+    n_val_rows  = min(n_val_rows, max(0, N - n_test_rows))
+    n_train_rows= max(0, N - n_val_rows - n_test_rows)
+    return n_train_rows, n_val_rows, n_test_rows
+
 # ---------------- MASTER BUILD ---------------- #
 
-def split_and_scale_master(raw_X: Path, raw_y: Path, raw_sid: Path, raw_meta: Path, out_dir: Path,
-                           train_frac=0.7, val_frac=0.15, robust=True, per_symbol=True):
+def split_and_scale_master(raw_X: Path, raw_y: Path, raw_sid: Path, raw_t: Path, raw_meta: Path, out_dir: Path,
+                           train_frac=0.7, val_frac=0.15, robust=True, per_symbol=True,
+                           test_days: int = 0, val_days: int = 0, seq_len: int = 64, max_horizon: int = 8):
     """
-    Fit scaler(s) on train split and save train/val/test + scaler(s) + meta.
+    Fit scaler(s) on TRAIN ONLY and save train/val/test + scaler(s) + meta.
+    If test_days>0 (or val_days>0), use day-length holdouts with purge gaps;
+    otherwise fall back to ratio-based split.
     """
     from sklearn.preprocessing import StandardScaler, RobustScaler
 
-    X = np.load(raw_X); y = np.load(raw_y); symids = np.load(raw_sid)
+    X = np.load(raw_X); y = np.load(raw_y); symids = np.load(raw_sid); times = np.load(raw_t)
     meta = load_meta(raw_meta)
-
     N = len(X)
-    n_train = int(N * train_frac)
-    n_val   = int(N * (train_frac + val_frac))
-    tr_sl = slice(0, n_train); va_sl = slice(n_train, n_val); te_sl = slice(n_val, N)
+    num_symbols = int(np.max(symids)) + 1 if symids.size > 0 else 1
 
     Scaler = RobustScaler if robust else StandardScaler
 
     ensure_dir(out_dir)
 
+    use_days_based = (test_days > 0 or val_days > 0)
+
+    if use_days_based:
+        # Approximate rows by trading days, then insert purge gaps in *rows*
+        n_train_rows, n_val_rows, n_test_rows = _approx_rows_for_days(test_days, val_days, meta, symids)
+        purge_bars = max(0, (int(seq_len) - 1) + int(max_horizon))
+        tr_sl, va_sl, te_sl = _row_slices_with_purge(
+            N=N, num_symbols=num_symbols,
+            n_val_rows=n_val_rows, n_test_rows=n_test_rows,
+            purge_bars=purge_bars
+        )
+        split_info = {
+            "mode": "days",
+            "val_days": int(val_days),
+            "test_days": int(test_days),
+            "bars_per_day": _bars_per_trading_day(meta),
+            "purge_bars": purge_bars,
+            "purge_rows": purge_bars * num_symbols,
+            "train_rows": int(tr_sl.stop - tr_sl.start),
+            "val_rows": int(va_sl.stop - va_sl.start),
+            "test_rows": int(te_sl.stop - te_sl.start),
+        }
+    else:
+        # Ratio split (legacy)
+        n_train = int(N * train_frac)
+        n_val   = int(N * (train_frac + val_frac))
+        tr_sl = slice(0, n_train); va_sl = slice(n_train, n_val); te_sl = slice(n_val, N)
+        split_info = {
+            "mode": "ratio",
+            "train_frac": float(train_frac),
+            "val_frac": float(val_frac),
+            "train_rows": int(n_train),
+            "val_rows": int(n_val - n_train),
+            "test_rows": int(N - n_val),
+            "purge_bars": 0,
+            "purge_rows": 0,
+        }
+
+    # Scale (fit on TRAIN only)
     if per_symbol:
         scalers = {}
         X_tr = np.empty_like(X[tr_sl]); X_va = np.empty_like(X[va_sl]); X_te = np.empty_like(X[te_sl])
         for sid in np.unique(symids):
-            tr_mask = (symids[tr_sl] == sid)
-            va_mask = (symids[va_sl] == sid)
-            te_mask = (symids[te_sl] == sid)
+            m_tr = (symids[tr_sl] == sid)
+            m_va = (symids[va_sl] == sid)
+            m_te = (symids[te_sl] == sid)
             scaler = Scaler()
-            if tr_mask.sum() == 0:
-                scaler.fit(X[tr_sl])
+            if m_tr.sum() == 0:
+                scaler.fit(X[tr_sl])  # rare, but keep pipeline moving
             else:
-                scaler.fit(X[tr_sl][tr_mask])
+                scaler.fit(X[tr_sl][m_tr])
             scalers[int(sid)] = scaler
-            if tr_mask.any(): X_tr[tr_mask] = scaler.transform(X[tr_sl][tr_mask])
-            if va_mask.any(): X_va[va_mask] = scaler.transform(X[va_sl][va_mask])
-            if te_mask.any(): X_te[te_mask] = scaler.transform(X[te_sl][te_mask])
+            if m_tr.any(): X_tr[m_tr] = scaler.transform(X[tr_sl][m_tr])
+            if m_va.any(): X_va[m_va] = scaler.transform(X[va_sl][m_va])
+            if m_te.any(): X_te[m_te] = scaler.transform(X[te_sl][m_te])
 
         np.savez_compressed(out_dir / "train.npz", X=X_tr, y=y[tr_sl], sym_id=symids[tr_sl])
         np.savez_compressed(out_dir / "val.npz",   X=X_va, y=y[va_sl], sym_id=symids[va_sl])
@@ -130,12 +238,19 @@ def split_and_scale_master(raw_X: Path, raw_y: Path, raw_sid: Path, raw_meta: Pa
         joblib.dump(scaler, out_dir / "scaler.joblib")
         scale_scope = "global"
 
+    # Update meta
     meta.update({
-        "N": int(N), "n_train": int(n_train), "n_val": int(n_val), "n_test": int(N - n_val),
-        "scale_scope": scale_scope, "robust": bool(robust),
+        "N": int(N),
+        "n_train": int((tr_sl.stop or 0) - (tr_sl.start or 0)),
+        "n_val":   int((va_sl.stop or 0) - (va_sl.start or 0)),
+        "n_test":  int((te_sl.stop or 0) - (te_sl.start or 0)),
+        "scale_scope": scale_scope,
+        "robust": bool(robust),
+        "split": split_info,
     })
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"[MASTER] wrote dataset to {out_dir}")
+    print(f"[SPLIT] {split_info}")
 
 def init_extended_master_from_version(version_dir: Path):
     """
@@ -252,8 +367,12 @@ def main():
     ap.add_argument("--delta-days", type=int, default=30, help="Recent window for delta updates.")
     ap.add_argument("--robust", action="store_true", help="Use RobustScaler (default True for master).")
     ap.add_argument("--global-scale", action="store_true", help="Use global scaler instead of per-symbol (master only).")
-    ap.add_argument("--seq-len", type=int, default=64, help="Model sequence length for delta purge.")
-    ap.add_argument("--max-horizon", type=int, default=8, help="Max label horizon (bars) for delta purge.")
+    ap.add_argument("--seq-len", type=int, default=64, help="Model sequence length (used for purge gaps).")
+    ap.add_argument("--max-horizon", type=int, default=8, help="Max label horizon (bars) for purge gaps.")
+    # NEW: day-length holdout for master split
+    ap.add_argument("--test-days", type=int, default=0, help="If >0, use last N trading days for TEST (with purge).")
+    ap.add_argument("--val-days",  type=int, default=0, help="If >0, use previous M trading days for VAL (with purge).")
+
     args = ap.parse_args()
 
     today = dt.date.today()
@@ -264,14 +383,18 @@ def main():
         out_version = DATASETS / version
         ensure_empty_dir(out_version)
 
-        # 1) Build raw features/labels for ~2y window
+        # 1) Build raw features/labels for ~lookback window
         raw_X, raw_y, raw_sid, raw_t, raw_meta = build_raw(args.symbols, start, end, out_version)
 
         # 2) Split + scale (fit on train) and write version dir
         split_and_scale_master(
-            raw_X, raw_y, raw_sid, raw_meta, out_version,
-            robust=(args.robust or True),  # robust default True
-            per_symbol=(not args.global_scale)
+            raw_X, raw_y, raw_sid, raw_t, raw_meta, out_version,
+            robust=(args.robust or True),           # robust default True
+            per_symbol=(not args.global_scale),
+            test_days=args.test_days,
+            val_days=args.val_days,
+            seq_len=args.seq_len,
+            max_horizon=args.max_horizon,
         )
 
         # 3) Update "master" pointer
@@ -279,7 +402,7 @@ def main():
         (DATASETS / "master").symlink_to(out_version.name)  # relative symlink
         (DATASETS / "MASTER").write_text(version)           # plain text pointer
 
-        # 4) Initialize extended master from this version (one-time per new master)
+        # 4) Initialize extended master from this version
         init_extended_master_from_version(out_version)
 
         print(f"[MASTER] Now pointing master -> {version}")
