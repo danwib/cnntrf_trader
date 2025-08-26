@@ -159,6 +159,72 @@ def baselines(y: torch.Tensor) -> Dict[str, float]:
     majority = max(p_up, 1 - p_up)  # always predict the majority sign
     return {"coin_flip": 0.5, "majority_sign": majority, "p_up": p_up}
 
+def non_overlap_expectancy(
+    yhat: torch.Tensor,
+    y: torch.Tensor,
+    sym: torch.Tensor,
+    horizon_bars: int,
+    top_pcts: List[int],
+    cost_bps: float = 2.0,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Trade only when |yhat| is in top X% *and* do not allow overlapping positions
+    for the same symbol within the holding horizon (in bars). We walk each symbol's
+    series in time order and enforce a cooldown of `horizon_bars` after each trade.
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    abs_yhat = torch.abs(yhat)
+    N = y.shape[0]
+    cost = cost_bps / 1e4
+
+    # Precompute global thresholds so coverage matches the overlap version
+    thresholds: Dict[int, float] = {}
+    for pct in top_pcts:
+        q = 1.0 - (pct / 100.0)
+        thresholds[pct] = float(torch.quantile(abs_yhat, q).item()) if N > 0 else float("inf")
+
+    # Group indices by symbol, preserving time order as they appear in yhat/y
+    by_sym: Dict[int, torch.Tensor] = {}
+    for s in torch.unique(sym).tolist():
+        idx = torch.nonzero(sym == s, as_tuple=False).squeeze(1)
+        by_sym[int(s)] = idx
+
+    for pct in top_pcts:
+        tau = thresholds[pct]
+        trades = []
+        # Walk each symbol independently
+        for s, idx in by_sym.items():
+            if idx.numel() == 0: 
+                continue
+            cooldown = 0
+            for k in range(idx.numel()):
+                i = int(idx[k].item())
+                if cooldown > 0:
+                    cooldown -= 1
+                    continue
+                if abs_yhat[i].item() >= tau:
+                    # take a trade in the sign of yhat[i]
+                    trades.append(i)
+                    cooldown = max(0, horizon_bars - 1)  # skip next horizon-1 bars for this symbol
+
+        if len(trades) == 0:
+            out[str(pct)] = {"coverage": 0.0, "trades": 0.0, "gross_bps": float("nan"),
+                             "net_bps": float("nan"), "hit_rate": float("nan")}
+            continue
+
+        tr_idx = torch.tensor(trades, dtype=torch.long)
+        gross = (torch.sign(yhat[tr_idx]) * y[tr_idx]).mean().item()
+        net = gross - cost
+        hit = torch.mean((torch.sign(yhat[tr_idx]) == torch.sign(y[tr_idx])).float()).item()
+        out[str(pct)] = {
+            "coverage": len(trades) / max(N, 1),
+            "trades": float(len(trades)),
+            "gross_bps": gross * 1e4,
+            "net_bps": net * 1e4,
+            "hit_rate": hit,
+        }
+    return out
+
 
 def thresholded_expectancy(
     yhat: torch.Tensor,
@@ -236,11 +302,16 @@ def main():
     p.add_argument("--seq-len", type=int, default=None, help="Override seq_len for loader (usually read from ckpt)")
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--out", type=str, default=None, help="Where to write metrics JSON (defaults next to checkpoint)")
-    # New options for expectancy
+    # Expectancy options
     p.add_argument("--cost-bps", type=float, default=2.0, help="Round-trip cost per trade, in bps")
     p.add_argument("--trade-top-pcts", type=str, default="10,20,30,40",
                    help="Comma list of top-|ŷ| percent thresholds to evaluate (e.g., 10,30,50)")
     p.add_argument("--per-symbol-csv", type=str, default=None, help="Optional CSV path for per-symbol metrics")
+    p.add_argument("--no-overlap-per-symbol", action="store_true",
+                   help="Compute a per-symbol expectancy that forbids overlapping positions over the horizon.")
+    p.add_argument("--horizon-bars", type=int, default=None,
+                   help="Holding horizon in base bars used to enforce non-overlap. "
+                        "Defaults to the first entry in meta['label_horizons'] if available.")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -293,12 +364,11 @@ def main():
     per_sym = per_symbol_metrics(yhat, y, sym)
     symmap = None
     if "sym2id" in meta and isinstance(meta["sym2id"], dict):
-        # meta["sym2id"] maps symbol->id; invert it
         symmap = {int(v): k for k, v in meta["sym2id"].items()}
     if args.per_symbol_csv:
         write_per_symbol_csv(Path(args.per_symbol_csv), per_sym, symmap)
 
-    # Assemble report
+    # Assemble report dict (not a set!)
     report = {
         "checkpoint": str(ckpt_path),
         "master_dir": str(master_dir),
@@ -323,11 +393,22 @@ def main():
         },
     }
 
+    # Optional non-overlap expectancy (append to the dict)
+    if args.no_overlap_per_symbol:
+        # Determine horizon_bars for non-overlap logic
+        hbars = args.horizon_bars
+        if hbars is None:
+            if isinstance(meta.get("label_horizons"), list) and meta["label_horizons"]:
+                hbars = int(meta["label_horizons"][0])
+            else:
+                hbars = 4  # default ~1h if base=15m
+        exp_no = non_overlap_expectancy(
+            yhat, y, sym, horizon_bars=hbars, top_pcts=top_pcts, cost_bps=args.cost_bps
+        )
+        report["expectancy_no_overlap"] = exp_no
+
     # Save metrics JSON
-    if args.out:
-        out_path = Path(args.out)
-    else:
-        out_path = ckpt_path.parent / "metrics_test_rich.json"
+    out_path = Path(args.out) if args.out else ckpt_path.parent / "metrics_test_rich.json"
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2)
     print(json.dumps(report, indent=2))
